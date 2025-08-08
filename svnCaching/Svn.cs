@@ -20,6 +20,8 @@ namespace svnCaching
         private readonly string jsonFilePath;
         private readonly TimeSpan maxAgeTrunk;
         private readonly TimeSpan maxAgeDays;
+        private readonly List<string> allowedThumbprints;
+        private readonly bool allowUntrustedCertificates;
         private static readonly Mutex syncMutex = new Mutex(false, "Global\\SvnCachingSyncMutex");
         private bool disposedValue = false;
 
@@ -30,6 +32,8 @@ namespace svnCaching
             this.jsonFilePath = configuration.AccessTimesJson;
             this.maxAgeTrunk = TimeSpan.FromDays(configuration.MaxAgeDaysTrunk);
             this.maxAgeDays = TimeSpan.FromDays(configuration.MaxAgeDays);
+            this.allowUntrustedCertificates = configuration.AllowUntrustedCertificates;
+            this.allowedThumbprints = configuration.AllowedCertificateThumbprints ?? new List<string>();
             CreateClient(url, new NetworkCredential(configuration.Username, configuration.Password));
         }
 
@@ -43,14 +47,22 @@ namespace svnCaching
         {
             client.Authentication.DefaultCredentials = credentials;
             client.Authentication.SslServerTrustHandlers += new EventHandler<SharpSvn.Security.SvnSslServerTrustEventArgs>(SVN_SSL_Override);
-
             uri = new Uri(url);
         }
 
         private static void SVN_SSL_Override(object sender, SharpSvn.Security.SvnSslServerTrustEventArgs e)
         {
-            e.AcceptedFailures = e.Failures;
-            e.Save = true;
+            if (!allowUntrustedCertificates)
+                return;
+            var cert = e.Certificate;
+            if (cert == null)
+                return;
+            var thumbprint = cert.GetCertHashString();
+            if (allowedThumbprints.Contains(thumbprint, StringComparer.OrdinalIgnoreCase))
+            {
+                e.AcceptedFailures = e.Failures;
+                e.Save = true;
+            }
         }
 
         public void Update(string directory)
@@ -95,6 +107,7 @@ namespace svnCaching
             {
                 if (Directory.Exists(destination))
                 {
+                    //what to do if the directory exists but the update failed?
                     Exception e = ForceDeleteDirectory(destination);
                     if (accessTimes != null && e == null)
                     {

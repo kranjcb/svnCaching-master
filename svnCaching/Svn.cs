@@ -108,6 +108,7 @@ namespace svnCaching
                 if (Directory.Exists(destination))
                 {
                     //what to do if the directory exists but the update failed?
+                    //todo neki neki
                     Exception e = ForceDeleteDirectory(destination);
                     if (accessTimes != null && e == null)
                     {

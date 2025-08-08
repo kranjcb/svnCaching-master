@@ -21,7 +21,6 @@ namespace svnCaching
         private readonly TimeSpan maxAgeTrunk;
         private readonly TimeSpan maxAgeDays;
         private static readonly Mutex syncMutex = new Mutex(false, "Global\\SvnCachingSyncMutex");
-        private readonly object clientLock = new object();
         private bool disposedValue = false;
 
         public Svn(Config configuration)
@@ -50,11 +49,8 @@ namespace svnCaching
 
         private static void SVN_SSL_Override(object sender, SharpSvn.Security.SvnSslServerTrustEventArgs e)
         {
-            if (Environment.GetEnvironmentVariable("SVN_ALLOW_UNTRUSTED_SSL") == "1")
-            {
-                e.AcceptedFailures = e.Failures;
-                e.Save = true;
-            }
+            e.AcceptedFailures = e.Failures;
+            e.Save = true;
         }
 
         public void Update(string directory)
@@ -75,41 +71,41 @@ namespace svnCaching
                     logger.Warn(ex, "Abandoned mutex detected.");
                     hasHandle = true;
                 }
-                lock (clientLock)
+
+                accessTimes = GetFromJson();
+                if (!Directory.Exists(destination))
                 {
-                    accessTimes = GetFromJson();
-                    if (!Directory.Exists(destination))
+                    client.CheckOut(target, destination, out _);
+                    logger.Trace("Checkingout {0} to {1}", target, destination);
+                    accessTimes[destination] = new FileAccessInfo(destination, DateTime.Now);
+                }
+                else
+                {
+                    if (accessTimes.TryGetValue(destination, out FileAccessInfo accesTime))
                     {
-                        client.CheckOut(target, destination, out _);
-                        logger.Trace("Checkingout {0} to {1}", target, destination);
-                        accessTimes[destination] = new FileAccessInfo(destination, DateTime.Now);
-                    }
-
-                    else
-                    {
-                        if (accessTimes.TryGetValue(destination, out FileAccessInfo accesTime))
-                        {
-
-                            client.Update(destination, out _);
-                        }
+                        client.Update(destination, out _);
                         logger.Trace("Updating {0}", destination);
                         accesTime.LastAccessTime = DateTime.Now;
                         accessTimes[destination] = accesTime;
-
                     }
+
                 }
             }
             catch (Exception ex)
             {
                 if (Directory.Exists(destination))
                 {
-                    ForceDeleteDirectory(destination);
-                    if (accessTimes != null)
+                    Exception e = ForceDeleteDirectory(destination);
+                    if (accessTimes != null && e == null)
                     {
                         accessTimes.Remove(destination);
                         LogAccessTimes(accessTimes);
+                        logger.Trace(ex, "Deleting directory {0}", destination);
                     }
-                    logger.Trace(ex, "Deleting directory {0}", destination);
+                    else if (e != null)
+                    {
+                        e.Throw();
+                    }
                 }
                 else
                 {
@@ -149,16 +145,20 @@ namespace svnCaching
                     logger.Warn(ex, "Abandoned mutex detected.");
                     hasHandle = true;
                 }
-                lock (clientLock)
+                accessTimes = GetFromJson();
+                if (!Directory.Exists(destination))
                 {
-                    accessTimes = GetFromJson();
-                    if (!Directory.Exists(destination))
+                    client.Export(target, destination, exportArgs, out _);
+                    logger.Trace("Exporting {0} to {1}", target, destination);
+                    accessTimes[destination] = new FileAccessInfo(destination, DateTime.Now);
+                }
+                else
+                {
+                    if (accessTimes.TryGetValue(destination, out FileAccessInfo accesTime))
                     {
-
-                        client.Export(target, destination, exportArgs, out _);
-
-                        logger.Trace("Exporting {0} to {1}", target, destination);
-                        accessTimes[destination] = new FileAccessInfo(destination, DateTime.Now);
+                        logger.Trace("Updating access time {0}", destination);
+                        accesTime.LastAccessTime = DateTime.Now;
+                        accessTimes[destination] = accesTime;
                     }
                 }
             }
@@ -182,80 +182,61 @@ namespace svnCaching
 
             if (!File.Exists(jsonFilePath))
                 return new Dictionary<string, FileAccessInfo>();
-            lock (clientLock)
+            try
             {
-                try
-                {
-                    string json = File.ReadAllText(jsonFilePath);
-                    var list = JsonConvert.DeserializeObject<List<FileAccessInfo>>(json) ?? new List<FileAccessInfo>();
-                    return list.ToDictionary(f => f.FolderPath, f => f);
-                }
-                catch (Exception ex)
-                {
-                    ex.Data.Add("JsonFilePath", jsonFilePath);
-                    ex.Throw();
-                    return new Dictionary<string, FileAccessInfo>();
-                }
+                string json = File.ReadAllText(jsonFilePath);
+                var list = JsonConvert.DeserializeObject<List<FileAccessInfo>>(json) ?? new List<FileAccessInfo>();
+                return list.ToDictionary(f => f.FolderPath, f => f);
             }
+            catch (Exception ex)
+            {
+                ex.Data.Add("JsonFilePath", jsonFilePath);
+                ex.Throw();
+                return new Dictionary<string, FileAccessInfo>();
+            }
+
         }
 
         private void LogAccessTimes(Dictionary<string, FileAccessInfo> files)
         {
             if (files == null)
                 return;
-            lock (clientLock)
-            {
-                var list = files.Values.ToList();
-                string json = JsonConvert.SerializeObject(list, Formatting.Indented);
-                File.WriteAllText(jsonFilePath, json);
-            }
+            var list = files.Values.ToList();
+            string json = JsonConvert.SerializeObject(list, Formatting.Indented);
+            File.WriteAllText(jsonFilePath, json);
         }
 
-        private void CleanFolders(string path, TimeSpan maxAge, List<Exception> exceptions)
+        private void CleanFolders(string path, TimeSpan maxAge, List<Exception> exceptions, Dictionary<string, FileAccessInfo> accessTimes)
         {
             if (!Directory.Exists(path)) return;
 
             var now = DateTime.Now;
             var folders = Directory.GetDirectories(path, "*", SearchOption.TopDirectoryOnly);
-            Dictionary<string, FileAccessInfo> accessTimes = null;
-            bool hasHandle = false;
-            try
+            foreach (var folder in folders)
             {
                 try
                 {
-                    hasHandle = syncMutex.WaitOne();
-                }
-                catch (AbandonedMutexException ex)
-                {
-                    logger.Warn(ex, "Abandoned mutex detected.");
-                    hasHandle = true;
-                }
-
-                accessTimes = GetFromJson();
-                foreach (var folder in folders)
-                {
-                    try
+                    if (accessTimes.TryGetValue(folder, out FileAccessInfo fileAccess) && (now - fileAccess.LastAccessTime) > maxAge)
                     {
-                        if (accessTimes.TryGetValue(folder, out FileAccessInfo fileAccess) && (now - fileAccess.LastAccessTime) > maxAge)
+                        Exception ex = ForceDeleteDirectory(folder);
+                        if (ex == null)
                         {
-                            ForceDeleteDirectory(folder);
                             logger.Trace("Clearing {0}", folder);
                             accessTimes.Remove(folder);
                         }
-                    }
-                    catch (Exception ex)
-                    {
-                        ex.Data.Add("Path", path);
-                        ex.Data.Add("Folder", folder);
-                        exceptions.Add(ex);
+                        else
+                        {
+                            exceptions.Add(ex);
+                            logger.Error(ex, "Error while clearing {0}", folder);
+                        }
                     }
                 }
-            }
-            finally
-            {
-                LogAccessTimes(accessTimes);
-                if (hasHandle)
-                    syncMutex.ReleaseMutex();
+                catch (Exception ex)
+                {
+                    ex.Data.Add("Path", path);
+                    ex.Data.Add("Folder", folder);
+                    exceptions.Add(ex);
+                }
             }
         }
 
@@ -274,11 +255,13 @@ namespace svnCaching
                     logger.Warn(ex, "Abandoned mutex detected.");
                     hasHandle = true;
                 }
-
+                Dictionary<string, FileAccessInfo> accessTimes = null;
+                accessTimes = GetFromJson();
                 var exceptions = new List<Exception>();
-                CleanFolders(localPath, maxAgeTrunk, exceptions);
-                CleanFolders(Path.Combine(localPath, "tags"), maxAgeDays, exceptions);
-                CleanFolders(Path.Combine(localPath, "branches"), maxAgeDays, exceptions);
+                CleanFolders(localPath, maxAgeTrunk, exceptions, accessTimes);
+                CleanFolders(Path.Combine(localPath, "tags"), maxAgeDays, exceptions, accessTimes);
+                CleanFolders(Path.Combine(localPath, "branches"), maxAgeDays, exceptions, accessTimes);
+                LogAccessTimes(accessTimes);
                 if (exceptions.Count > 0)
                 {
                     var ex = new AggregateException("Errors occurred during cleaning", exceptions);
@@ -294,21 +277,32 @@ namespace svnCaching
             }
         }
 
-        private static void ForceDeleteDirectory(string path)
+        private static Exception ForceDeleteDirectory(string path)
         {
             if (!Directory.Exists(path))
-                return;
+                return null;
 
-            foreach (string file in Directory.GetFiles(path, "*", SearchOption.AllDirectories))
+            try
             {
-                var attributes = File.GetAttributes(file);
-                if ((attributes & FileAttributes.ReadOnly) == FileAttributes.ReadOnly)
+                foreach (string file in Directory.GetFiles(path, "*", SearchOption.AllDirectories))
                 {
-                    File.SetAttributes(file, attributes & ~FileAttributes.ReadOnly);
-                }
-            }
 
-            Directory.Delete(path, true);
+                    var attributes = File.GetAttributes(file);
+                    if ((attributes & FileAttributes.ReadOnly) == FileAttributes.ReadOnly)
+                    {
+                        File.SetAttributes(file, attributes & ~FileAttributes.ReadOnly);
+                    }
+
+                }
+
+                Directory.Delete(path, true);
+                return null;
+            }
+            catch (Exception ex)
+            {
+                ex.Data.Add("Path", path);
+                return ex;
+            }
         }
 
         public static string CombinePath(string localPath, string directory, int revision)
@@ -325,11 +319,6 @@ namespace svnCaching
         {
             if (disposedValue)
                 throw new ObjectDisposedException(nameof(Svn));
-        }
-
-        ~Svn()
-        {
-            Dispose(false);
         }
 
         public void Dispose()

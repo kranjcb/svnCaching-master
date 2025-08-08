@@ -1,0 +1,7 @@
+﻿C:\Users\lukak\source\repos\svnCaching\svnCachingTests\Properties\AssemblyInfo.cs
+C:\Users\lukak\source\repos\svnCaching\svnCachingTests\SvnTests.cs
+C:\Users\lukak\source\repos\svnCaching\svnCachingTests\App.config
+C:\Users\lukak\source\repos\svnCaching\svnCachingTests\packages.config
+C:\Users\lukak\source\repos\svnCaching\packages\MSTest.TestAdapter.3.9.3\buildTransitive\net462\Microsoft.VisualStudio.TestPlatform.MSTest.TestAdapter.dll
+C:\Users\lukak\source\repos\svnCaching\packages\MSTest.TestAdapter.3.9.3\buildTransitive\net462\Microsoft.VisualStudio.TestPlatform.MSTestAdapter.PlatformServices.dll
+C:\Users\lukak\source\repos\svnCaching\packages\MSTest.TestAdapter.3.9.3\buildTransitive\net462\Microsoft.TestPlatform.AdapterUtilities.dll

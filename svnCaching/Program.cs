@@ -1,0 +1,27 @@
+﻿using System;
+using System.Diagnostics;
+using System.IO;
+
+namespace svnCaching
+{
+    public class Program
+    {
+        public const string Trunk = "trunk";
+        public const string Branches = "branches";
+        public const string Tags = "tags";
+        private Program(){}
+        public static void Main(string[] args)
+        {
+            Svn s = new Svn(Svn.GetFromFile("config.json"));
+            var sw = Stopwatch.StartNew();
+            s.Clean();
+            s.Update(Path.Combine(Tags, "DBS"));
+            s.Update(Path.Combine(Tags, "2. Semester"));
+            s.Update(Trunk);
+            s.ExportToRevision(Trunk, 100);
+            sw.Stop();
+
+            Console.WriteLine($"All updates completed in {sw.Elapsed.TotalSeconds:F2} seconds");
+        }
+    }
+}

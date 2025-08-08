@@ -1,4 +1,4 @@
-﻿using System;
+using System;
 using System.Collections.Generic;
 using System.IO;
 using System.Linq;
@@ -65,6 +65,13 @@ namespace svnCaching
             }
         }
 
+        /// <summary>
+        /// Updates the local cache of the specified SVN directory by performing a checkout if it does not exist, or an update if it does.
+        /// </summary>
+        /// <param name="directory">The relative path of the SVN directory to update in the local cache.</param>
+        /// <remarks>
+        /// If the update fails and the directory exists, the method attempts to delete the local directory and remove its access metadata. Access times are updated and persisted after the operation. Throws exceptions with additional context if errors occur.
+        /// </remarks>
         public void Update(string directory)
         {
             ThrowIfDisposed();

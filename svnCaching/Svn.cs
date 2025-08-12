@@ -1,13 +1,13 @@
-﻿using System;
+using System;
 using System.Collections.Generic;
 using System.IO;
 using System.Linq;
 using System.Net;
 using System.Threading;
+using i4;
 using Newtonsoft.Json;
 using NLog;
 using SharpSvn;
-using i4;
 
 namespace svnCaching
 {
@@ -20,8 +20,6 @@ namespace svnCaching
         private readonly string jsonFilePath;
         private readonly TimeSpan maxAgeTrunk;
         private readonly TimeSpan maxAgeDays;
-        private readonly List<string> allowedThumbprints;
-        private readonly bool allowUntrustedCertificates;
         private static readonly Mutex syncMutex = new Mutex(false, "Global\\SvnCachingSyncMutex");
         private bool disposedValue = false;
 
@@ -32,8 +30,6 @@ namespace svnCaching
             this.jsonFilePath = configuration.AccessTimesJson;
             this.maxAgeTrunk = TimeSpan.FromDays(configuration.MaxAgeDaysTrunk);
             this.maxAgeDays = TimeSpan.FromDays(configuration.MaxAgeDays);
-            this.allowUntrustedCertificates = configuration.AllowUntrustedCertificates;
-            this.allowedThumbprints = configuration.AllowedCertificateThumbprints ?? new List<string>();
             CreateClient(url, new NetworkCredential(configuration.Username, configuration.Password));
         }
 
@@ -47,22 +43,14 @@ namespace svnCaching
         {
             client.Authentication.DefaultCredentials = credentials;
             client.Authentication.SslServerTrustHandlers += new EventHandler<SharpSvn.Security.SvnSslServerTrustEventArgs>(SVN_SSL_Override);
+
             uri = new Uri(url);
         }
 
         private static void SVN_SSL_Override(object sender, SharpSvn.Security.SvnSslServerTrustEventArgs e)
         {
-            if (!allowUntrustedCertificates)
-                return;
-            var cert = e.Certificate;
-            if (cert == null)
-                return;
-            var thumbprint = cert.GetCertHashString();
-            if (allowedThumbprints.Contains(thumbprint, StringComparer.OrdinalIgnoreCase))
-            {
-                e.AcceptedFailures = e.Failures;
-                e.Save = true;
-            }
+            e.AcceptedFailures = e.Failures;
+            e.Save = true;
         }
 
         public void Update(string directory)
@@ -85,30 +73,12 @@ namespace svnCaching
                 }
 
                 accessTimes = GetFromJson();
-                if (!Directory.Exists(destination))
-                {
-                    client.CheckOut(target, destination, out _);
-                    logger.Trace("Checkingout {0} to {1}", target, destination);
-                    accessTimes[destination] = new FileAccessInfo(destination, DateTime.Now);
-                }
-                else
-                {
-                    if (accessTimes.TryGetValue(destination, out FileAccessInfo accesTime))
-                    {
-                        client.Update(destination, out _);
-                        logger.Trace("Updating {0}", destination);
-                        accesTime.LastAccessTime = DateTime.Now;
-                        accessTimes[destination] = accesTime;
-                    }
-
-                }
+                UpdateOrCheckoutRepository(target, destination, accessTimes);
             }
             catch (Exception ex)
             {
                 if (Directory.Exists(destination))
                 {
-                    //what to do if the directory exists but the update failed?
-                    //todo neki neki
                     Exception e = ForceDeleteDirectory(destination);
                     if (accessTimes != null && e == null)
                     {
@@ -134,7 +104,32 @@ namespace svnCaching
                 if (hasHandle)
                     syncMutex.ReleaseMutex();
             }
+        }
 
+        private void UpdateOrCheckoutRepository(SvnUriTarget target, string destination, Dictionary<string, FileAccessInfo> accessTimes)
+        {
+            if (!Directory.Exists(destination))
+            {
+                client.CheckOut(target, destination, out _);
+                logger.Trace("Checkingout {0} to {1}", target, destination);
+                accessTimes[destination] = new FileAccessInfo(destination, DateTime.Now);
+            }
+            else
+            {
+                if (accessTimes.TryGetValue(destination, out FileAccessInfo accesTime))
+                {
+                    client.Update(destination, out _);
+                    logger.Trace("Updating {0}", destination);
+                    accesTime.LastAccessTime = DateTime.Now;
+                    accessTimes[destination] = accesTime;
+                }
+                else if (Directory.Exists(destination))
+                {
+                    client.Update(destination, out _);
+                    logger.Trace("Updating and adding access time {0}", destination);
+                    accessTimes[destination] = new FileAccessInfo(destination, DateTime.Now);
+                }
+            }
         }
 
         public void ExportToRevision(string directory, int revision)
@@ -174,6 +169,11 @@ namespace svnCaching
                         accesTime.LastAccessTime = DateTime.Now;
                         accessTimes[destination] = accesTime;
                     }
+                    else if (Directory.Exists(destination))
+                    {
+                        logger.Trace("Adding access time {0}", destination);
+                        accessTimes[destination] = new FileAccessInfo(destination, DateTime.Now);
+                    }
                 }
             }
             catch (Exception ex)
@@ -208,41 +208,40 @@ namespace svnCaching
                 ex.Throw();
                 return new Dictionary<string, FileAccessInfo>();
             }
-
         }
 
         private void LogAccessTimes(Dictionary<string, FileAccessInfo> files)
         {
             if (files == null)
                 return;
-            var list = files.Values.ToList();
-            string json = JsonConvert.SerializeObject(list, Formatting.Indented);
-            File.WriteAllText(jsonFilePath, json);
+            try
+            {
+                var list = files.Values.ToList();
+                string json = JsonConvert.SerializeObject(list, Formatting.Indented);
+                File.WriteAllText(jsonFilePath, json);
+            }
+            catch (Exception ex)
+            {
+                ex.Data.Add($"{ex.Message}", jsonFilePath); 
+                ex.Throw();
+            }
         }
-
-        private void CleanFolders(string path, TimeSpan maxAge, List<Exception> exceptions, Dictionary<string, FileAccessInfo> accessTimes)
+        private void CleanFolders(string path, TimeSpan maxAge, List<Exception> exceptions, Dictionary<string, FileAccessInfo> accessTimes, Dictionary<string, FileAccessInfo> newAccess)
         {
             if (!Directory.Exists(path)) return;
 
-            var now = DateTime.Now;
             var folders = Directory.GetDirectories(path, "*", SearchOption.TopDirectoryOnly);
             foreach (var folder in folders)
             {
                 try
                 {
-                    if (accessTimes.TryGetValue(folder, out FileAccessInfo fileAccess) && (now - fileAccess.LastAccessTime) > maxAge)
+                    if (accessTimes.TryGetValue(folder, out FileAccessInfo fileAccess) && !(folder.EndsWith("branches") || folder.EndsWith("tags")))
                     {
-                        Exception ex = ForceDeleteDirectory(folder);
-                        if (ex == null)
-                        {
-                            logger.Trace("Clearing {0}", folder);
-                            accessTimes.Remove(folder);
-                        }
-                        else
-                        {
-                            exceptions.Add(ex);
-                            logger.Error(ex, "Error while clearing {0}", folder);
-                        }
+                        IsDirectoryTooOld(fileAccess, maxAge, folder, exceptions, newAccess); 
+                    }
+                    else if(!(folder.EndsWith("branches") || folder.EndsWith("tags")))
+                    {
+                        DeleteFolderWithoutAccessTime(folder, exceptions);
                     }
                 }
                 catch (Exception ex)
@@ -251,6 +250,38 @@ namespace svnCaching
                     ex.Data.Add("Folder", folder);
                     exceptions.Add(ex);
                 }
+            }
+        }
+
+        private static void DeleteFolderWithoutAccessTime(string folder, List<Exception> exceptions)
+        {
+            Exception ex = ForceDeleteDirectory(folder);
+            if (ex == null)
+            {
+                logger.Trace("Clearing {0} without access time", folder);
+            }
+            else
+            {
+                exceptions.Add(ex);
+                logger.Error(ex, "Error while clearing {0}", folder);
+            }
+        }
+
+        private static void IsDirectoryTooOld(FileAccessInfo fileAccess, TimeSpan maxAge, string folder, List<Exception> exceptions, Dictionary<string, FileAccessInfo> newAccess)
+        {
+            var now = DateTime.Now;
+            if ((now - fileAccess.LastAccessTime) > maxAge)
+            {
+                Exception ex = ForceDeleteDirectory(folder);
+                if (ex != null)
+                {
+                    exceptions.Add(ex);
+                    logger.Error(ex, "Error while clearing {0}", folder);
+                }
+            }
+            else
+            {
+                newAccess[folder] = fileAccess;
             }
         }
 
@@ -271,11 +302,14 @@ namespace svnCaching
                 }
                 Dictionary<string, FileAccessInfo> accessTimes = null;
                 accessTimes = GetFromJson();
+                string tagsPath = Path.Combine(localPath, "tags");
+                string branchesPath = Path.Combine(localPath, "branches");
                 var exceptions = new List<Exception>();
-                CleanFolders(localPath, maxAgeTrunk, exceptions, accessTimes);
-                CleanFolders(Path.Combine(localPath, "tags"), maxAgeDays, exceptions, accessTimes);
-                CleanFolders(Path.Combine(localPath, "branches"), maxAgeDays, exceptions, accessTimes);
-                LogAccessTimes(accessTimes);
+                Dictionary<string, FileAccessInfo> newAccess = new Dictionary<string, FileAccessInfo>();
+                CleanFolders(localPath, maxAgeTrunk, exceptions, accessTimes, newAccess);
+                CleanFolders(tagsPath, maxAgeDays, exceptions, accessTimes, newAccess);
+                CleanFolders(branchesPath, maxAgeDays, exceptions, accessTimes, newAccess);
+                LogAccessTimes(newAccess);
                 if (exceptions.Count > 0)
                 {
                     var ex = new AggregateException("Errors occurred during cleaning", exceptions);

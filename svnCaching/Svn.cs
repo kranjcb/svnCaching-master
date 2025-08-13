@@ -1,13 +1,14 @@
-﻿using System;
+using System;
 using System.Collections.Generic;
 using System.IO;
 using System.Linq;
 using System.Net;
+using System.Runtime.CompilerServices;
 using System.Threading;
+using i4;
 using Newtonsoft.Json;
 using NLog;
 using SharpSvn;
-using i4;
 
 namespace svnCaching
 {
@@ -20,8 +21,6 @@ namespace svnCaching
         private readonly string jsonFilePath;
         private readonly TimeSpan maxAgeTrunk;
         private readonly TimeSpan maxAgeDays;
-        private readonly List<string> allowedThumbprints;
-        private readonly bool allowUntrustedCertificates;
         private static readonly Mutex syncMutex = new Mutex(false, "Global\\SvnCachingSyncMutex");
         private bool disposedValue = false;
 
@@ -32,8 +31,6 @@ namespace svnCaching
             this.jsonFilePath = configuration.AccessTimesJson;
             this.maxAgeTrunk = TimeSpan.FromDays(configuration.MaxAgeDaysTrunk);
             this.maxAgeDays = TimeSpan.FromDays(configuration.MaxAgeDays);
-            this.allowUntrustedCertificates = configuration.AllowUntrustedCertificates;
-            this.allowedThumbprints = configuration.AllowedCertificateThumbprints ?? new List<string>();
             CreateClient(url, new NetworkCredential(configuration.Username, configuration.Password));
         }
 
@@ -47,22 +44,14 @@ namespace svnCaching
         {
             client.Authentication.DefaultCredentials = credentials;
             client.Authentication.SslServerTrustHandlers += new EventHandler<SharpSvn.Security.SvnSslServerTrustEventArgs>(SVN_SSL_Override);
+
             uri = new Uri(url);
         }
 
         private static void SVN_SSL_Override(object sender, SharpSvn.Security.SvnSslServerTrustEventArgs e)
         {
-            if (!allowUntrustedCertificates)
-                return;
-            var cert = e.Certificate;
-            if (cert == null)
-                return;
-            var thumbprint = cert.GetCertHashString();
-            if (allowedThumbprints.Contains(thumbprint, StringComparer.OrdinalIgnoreCase))
-            {
-                e.AcceptedFailures = e.Failures;
-                e.Save = true;
-            }
+            e.AcceptedFailures = e.Failures;
+            e.Save = true;
         }
 
         public void Update(string directory)
@@ -85,39 +74,24 @@ namespace svnCaching
                 }
 
                 accessTimes = GetFromJson();
-                if (!Directory.Exists(destination))
-                {
-                    client.CheckOut(target, destination, out _);
-                    logger.Trace("Checkingout {0} to {1}", target, destination);
-                    accessTimes[destination] = new FileAccessInfo(destination, DateTime.Now);
-                }
-                else
-                {
-                    if (accessTimes.TryGetValue(destination, out FileAccessInfo accesTime))
-                    {
-                        client.Update(destination, out _);
-                        logger.Trace("Updating {0}", destination);
-                        accesTime.LastAccessTime = DateTime.Now;
-                        accessTimes[destination] = accesTime;
-                    }
-
-                }
+                UpdateOrCheckoutRepository(target, destination, accessTimes);
             }
             catch (Exception ex)
             {
                 if (Directory.Exists(destination))
                 {
-                    //what to do if the directory exists but the update failed?
-                    //todo neki neki
-                    Exception e = ForceDeleteDirectory(destination);
-                    if (accessTimes != null && e == null)
+                    try
                     {
-                        accessTimes.Remove(destination);
-                        LogAccessTimes(accessTimes);
-                        logger.Trace(ex, "Deleting directory {0}", destination);
+                        ForceDeleteDirectory(destination);
+                        if(accessTimes != null) { 
+                            accessTimes.Remove(destination);
+                            LogAccessTimes(accessTimes);
+                            logger.Trace(ex, "Deleting directory {0}", destination);
+                        }
                     }
-                    else if (e != null)
+                    catch (Exception e)
                     {
+                        e.Data.Add("Destination", destination);
                         e.Throw();
                     }
                 }
@@ -134,7 +108,32 @@ namespace svnCaching
                 if (hasHandle)
                     syncMutex.ReleaseMutex();
             }
+        }
 
+        private void UpdateOrCheckoutRepository(SvnUriTarget target, string destination, Dictionary<string, FileAccessInfo> accessTimes)
+        {
+            if (!Directory.Exists(destination))
+            {
+                client.CheckOut(target, destination, out _);
+                logger.Trace("Checkingout {0} to {1}", target, destination);
+                accessTimes[destination] = new FileAccessInfo(destination, DateTime.Now);
+            }
+            else
+            {
+                if (accessTimes.TryGetValue(destination, out FileAccessInfo fileAccess))
+                {
+                    client.Update(destination, out _);
+                    logger.Trace("Updating {0}", destination);
+                    fileAccess.LastAccessTime = DateTime.Now;
+                    accessTimes[destination] = fileAccess;
+                }
+                else
+                {
+                    client.Update(destination, out _);
+                    logger.Trace("Updating and adding access time {0}", destination);
+                    accessTimes[destination] = new FileAccessInfo(destination, DateTime.Now);
+                }
+            }
         }
 
         public void ExportToRevision(string directory, int revision)
@@ -168,11 +167,16 @@ namespace svnCaching
                 }
                 else
                 {
-                    if (accessTimes.TryGetValue(destination, out FileAccessInfo accesTime))
+                    if (accessTimes.TryGetValue(destination, out FileAccessInfo fileAccess))
                     {
                         logger.Trace("Updating access time {0}", destination);
-                        accesTime.LastAccessTime = DateTime.Now;
-                        accessTimes[destination] = accesTime;
+                        fileAccess.LastAccessTime = DateTime.Now;
+                        accessTimes[destination] = fileAccess;
+                    }
+                    else
+                    {
+                        logger.Trace("Adding access time {0}", destination);
+                        accessTimes[destination] = new FileAccessInfo(destination, DateTime.Now);
                     }
                 }
             }
@@ -206,42 +210,49 @@ namespace svnCaching
             {
                 ex.Data.Add("JsonFilePath", jsonFilePath);
                 ex.Throw();
-                return new Dictionary<string, FileAccessInfo>();
             }
-
+            return new Dictionary<string, FileAccessInfo>();
         }
 
         private void LogAccessTimes(Dictionary<string, FileAccessInfo> files)
         {
             if (files == null)
                 return;
-            var list = files.Values.ToList();
-            string json = JsonConvert.SerializeObject(list, Formatting.Indented);
-            File.WriteAllText(jsonFilePath, json);
+            try
+            {
+                var list = files.Values.ToList();
+                string json = JsonConvert.SerializeObject(list, Formatting.Indented);
+                File.WriteAllText(jsonFilePath, json);
+            }
+            catch (Exception ex)
+            {
+                ex.Data.Add("jsonFilePath", jsonFilePath); 
+                ex.Throw();
+            }
         }
-
         private void CleanFolders(string path, TimeSpan maxAge, List<Exception> exceptions, Dictionary<string, FileAccessInfo> accessTimes)
         {
             if (!Directory.Exists(path)) return;
 
-            var now = DateTime.Now;
             var folders = Directory.GetDirectories(path, "*", SearchOption.TopDirectoryOnly);
             foreach (var folder in folders)
             {
                 try
                 {
-                    if (accessTimes.TryGetValue(folder, out FileAccessInfo fileAccess) && (now - fileAccess.LastAccessTime) > maxAge)
+                    if (accessTimes.TryGetValue(folder, out FileAccessInfo fileAccess) && !(folder.Equals(Path.Combine(localPath, "branches")) || folder.Equals(Path.Combine(localPath, "tags"))))
                     {
-                        Exception ex = ForceDeleteDirectory(folder);
-                        if (ex == null)
+                        ProcessOldDirectories(fileAccess, maxAge, folder, exceptions); 
+                    }
+                    else if(!(folder.Equals(Path.Combine(localPath, "branches")) || folder.Equals(Path.Combine(localPath, "tags"))))
+                    {
+                        try
                         {
-                            logger.Trace("Clearing {0}", folder);
-                            accessTimes.Remove(folder);
+                            ForceDeleteDirectory(folder);
+                            logger.Trace("Deleting directory {0} because it was not found in access times", folder);
                         }
-                        else
+                        catch (Exception ex)
                         {
                             exceptions.Add(ex);
-                            logger.Error(ex, "Error while clearing {0}", folder);
                         }
                     }
                 }
@@ -251,6 +262,33 @@ namespace svnCaching
                     ex.Data.Add("Folder", folder);
                     exceptions.Add(ex);
                 }
+            }
+            RemoveExcessAccess(accessTimes);
+        }
+
+        private static void ProcessOldDirectories(FileAccessInfo fileAccess, TimeSpan maxAge, string folder, List<Exception> exceptions)
+        {
+            var now = DateTime.Now;
+            if ((now - fileAccess.LastAccessTime) > maxAge)
+            {
+                try
+                {
+                    ForceDeleteDirectory(folder);
+                    logger.Trace("Deleting old directory {0}", folder);
+                }
+                catch (Exception ex)
+                {
+                    exceptions.Add(ex);
+                }
+            }
+        }
+
+        private void RemoveExcessAccess(Dictionary<string, FileAccessInfo> accessTimes)
+        {
+            foreach (var folderToRemove in accessTimes.Keys.Where(k => !Directory.Exists(k)).ToList())
+            {
+                accessTimes.Remove(folderToRemove);
+                logger.Trace("Removing access time for folder {0}", folderToRemove);
             }
         }
 
@@ -271,10 +309,12 @@ namespace svnCaching
                 }
                 Dictionary<string, FileAccessInfo> accessTimes = null;
                 accessTimes = GetFromJson();
+                string tagsPath = Path.Combine(localPath, "tags");
+                string branchesPath = Path.Combine(localPath, "branches");
                 var exceptions = new List<Exception>();
                 CleanFolders(localPath, maxAgeTrunk, exceptions, accessTimes);
-                CleanFolders(Path.Combine(localPath, "tags"), maxAgeDays, exceptions, accessTimes);
-                CleanFolders(Path.Combine(localPath, "branches"), maxAgeDays, exceptions, accessTimes);
+                CleanFolders(tagsPath, maxAgeDays, exceptions, accessTimes);
+                CleanFolders(branchesPath, maxAgeDays, exceptions, accessTimes);
                 LogAccessTimes(accessTimes);
                 if (exceptions.Count > 0)
                 {
@@ -291,32 +331,22 @@ namespace svnCaching
             }
         }
 
-        private static Exception ForceDeleteDirectory(string path)
+        private static void ForceDeleteDirectory(string path)
         {
             if (!Directory.Exists(path))
-                return null;
+                return;
 
-            try
+            foreach (string file in Directory.GetFiles(path, "*", SearchOption.AllDirectories))
             {
-                foreach (string file in Directory.GetFiles(path, "*", SearchOption.AllDirectories))
+
+                var attributes = File.GetAttributes(file);
+                if ((attributes & FileAttributes.ReadOnly) == FileAttributes.ReadOnly)
                 {
-
-                    var attributes = File.GetAttributes(file);
-                    if ((attributes & FileAttributes.ReadOnly) == FileAttributes.ReadOnly)
-                    {
-                        File.SetAttributes(file, attributes & ~FileAttributes.ReadOnly);
-                    }
-
+                    File.SetAttributes(file, attributes & ~FileAttributes.ReadOnly);
                 }
 
-                Directory.Delete(path, true);
-                return null;
             }
-            catch (Exception ex)
-            {
-                ex.Data.Add("Path", path);
-                return ex;
-            }
+            Directory.Delete(path, true);
         }
 
         public static string CombinePath(string localPath, string directory, int revision)

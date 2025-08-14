@@ -14,11 +14,13 @@ namespace svnCaching
         {
             Svn s = new Svn(Svn.GetFromFile("config.json"));
             var sw = Stopwatch.StartNew();
-            s.Clean();
             s.Update(Path.Combine(Tags, "DBS"));
             s.Update(Path.Combine(Tags, "2. Semester"));
-            s.Update(Trunk);
+            s.Update(Path.Combine(Branches, "b"));
+            s.Update(Path.Combine(Branches, "a0"));
             s.ExportToRevision(Trunk, 100);
+            s.ExportToRevision(Trunk, 101);
+            s.Clean();
             sw.Stop();
 
             Console.WriteLine($"All updates completed in {sw.Elapsed.TotalSeconds:F2} seconds");

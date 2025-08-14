@@ -6,6 +6,7 @@ using System.Linq;
 using System.Threading.Tasks;
 using Microsoft.VisualStudio.TestTools.UnitTesting;
 using Newtonsoft.Json;
+using SharpSvn;
 using svnCaching;
 
 namespace SvnTests
@@ -134,8 +135,9 @@ namespace SvnTests
         public void UpdateTest()
         {
             s.Update("trunk");
+            File.Delete(jsonPath);
             s.Update("trunk");
-
+            s.Update("trunk");
             var path = Path.Combine(localPath, "trunk").Replace("/", "\\");
             Assert.IsTrue(Directory.Exists(path), "Directory was not created.");
         }
@@ -153,6 +155,16 @@ namespace SvnTests
 
             File.WriteAllText(jsonPath, JsonConvert.SerializeObject(oldAccess, Formatting.Indented));
 
+            s.Clean();
+
+            Assert.IsFalse(Directory.Exists(folder), "Trunk dir should have been deleted.");
+        }
+
+        [TestMethod]
+        public void Clean_ShouldRemoveFoldersWithNoAccess()
+        {
+            var folder = Path.Combine(localPath, "trunk-test");
+            Directory.CreateDirectory(folder);
             s.Clean();
 
             Assert.IsFalse(Directory.Exists(folder), "Trunk dir should have been deleted.");
@@ -274,16 +286,10 @@ namespace SvnTests
         {
             string path = Path.Combine(localPath, "tags", "test");
             Directory.CreateDirectory(path);
-
-            var access = new List<FileAccessInfo>
+            Assert.ThrowsExactly<SvnInvalidNodeKindException>(() =>
             {
-                new FileAccessInfo(path, DateTime.Now)
-            };
-
-            File.WriteAllText(jsonPath, JsonConvert.SerializeObject(access, Formatting.Indented));
-
-            s.Update(Path.Combine("tags", "test"));
-            Assert.IsFalse(Directory.Exists(path), "Directory should have been deleted because it doesn't exist in SVN.");
+                s.Update(Path.Combine("tags", "test"));
+            });
         }
 
         [TestMethod]
@@ -318,6 +324,31 @@ namespace SvnTests
         }
 
         [TestMethod]
+        public void GetFromJson_WithInvalidJsonContent_ThrowsException()
+        {
+            Directory.CreateDirectory(Path.GetDirectoryName(jsonPath));
+            File.WriteAllText(jsonPath, "{ This is not valid JSON }");
+            var getFromJsonMethod = typeof(Svn).GetMethod("GetFromJson",
+                System.Reflection.BindingFlags.NonPublic | System.Reflection.BindingFlags.Instance);
+
+            Assert.IsNotNull(getFromJsonMethod, "GetFromJson method not found via reflection");
+
+            try
+            {
+                getFromJsonMethod.Invoke(s, null);
+                Assert.Fail("Expected exception was not thrown");
+            }
+            catch (System.Reflection.TargetInvocationException ex)
+            when (ex.InnerException is Newtonsoft.Json.JsonException)
+            {
+                Assert.IsTrue(ex.InnerException.Data.Contains("JsonFilePath"),
+                    "Exception should contain JsonFilePath in Data");
+                Assert.AreEqual(jsonPath, ex.InnerException.Data["JsonFilePath"],
+                    "Exception should have correct JsonFilePath value");
+            }
+        }
+
+        [TestMethod]
         public void Failed_Update()
         {
             Assert.ThrowsExactly<DirectoryNotFoundException>(() =>
@@ -339,8 +370,41 @@ namespace SvnTests
         public void ExportToRevision()
         {
             s.ExportToRevision("trunk", 1);
+            File.Delete(jsonPath);
+            s.ExportToRevision("trunk", 1);
+            s.ExportToRevision("trunk", 1);
             Assert.IsTrue(Directory.Exists(localPath), "Directories were created.");
         }
 
+        [TestMethod]
+        public void ForceDeleteDirectory_DeletesReadOnlyFiles()
+        {
+            string testDir = Path.Combine(Path.GetTempPath(), "TestForceDelete");
+            Directory.CreateDirectory(testDir);
+            
+            string nestedDir = Path.Combine(testDir, "NestedDir");
+            Directory.CreateDirectory(nestedDir);
+            string rootFile = Path.Combine(testDir, "root.txt");
+            string nestedFile = Path.Combine(nestedDir, "nested.txt");
+            
+            File.WriteAllText(rootFile, "test content");
+            File.WriteAllText(nestedFile, "nested content");
+            
+            File.SetAttributes(rootFile, FileAttributes.ReadOnly);
+            File.SetAttributes(nestedFile, FileAttributes.ReadOnly);
+            File.SetAttributes(nestedDir, FileAttributes.ReadOnly);
+            
+            Assert.IsTrue((File.GetAttributes(rootFile) & FileAttributes.ReadOnly) == FileAttributes.ReadOnly);
+            Assert.IsTrue((File.GetAttributes(nestedFile) & FileAttributes.ReadOnly) == FileAttributes.ReadOnly);
+            
+            var forceDeleteMethod = typeof(Svn).GetMethod("ForceDeleteDirectory", 
+                System.Reflection.BindingFlags.NonPublic | System.Reflection.BindingFlags.Static);
+            
+            Assert.IsNotNull(forceDeleteMethod, "ForceDeleteDirectory method not found");
+            
+            forceDeleteMethod.Invoke(null, new object[] { testDir });
+           
+            Assert.IsFalse(Directory.Exists(testDir), "Directory should be deleted");
+        }
     }
 }

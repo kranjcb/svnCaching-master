@@ -1,4 +1,4 @@
-using System;
+﻿using System;
 using System.Collections.Generic;
 using System.IO;
 using System.Linq;
@@ -77,26 +77,9 @@ namespace svnCaching
             }
             catch (Exception ex)
             {
-                if (Directory.Exists(destination))
-                {
-                    Exception e = ForceDeleteDirectory(destination);
-                    if (accessTimes != null && e == null)
-                    {
-                        accessTimes.Remove(destination);
-                        LogAccessTimes(accessTimes);
-                        logger.Trace(ex, "Deleting directory {0}", destination);
-                    }
-                    else if (e != null)
-                    {
-                        e.Throw();
-                    }
-                }
-                else
-                {
-                    ex.Data.Add("Destination", destination);
-                    ex.Data.Add("Directory", directory);
-                    ex.Throw();
-                }
+                ex.Data.Add("Destination", destination);
+                ex.Data.Add("Directory", directory);
+                ex.Throw();
             }
             finally
             {
@@ -116,14 +99,14 @@ namespace svnCaching
             }
             else
             {
-                if (accessTimes.TryGetValue(destination, out FileAccessInfo accesTime))
+                if (accessTimes.TryGetValue(destination, out FileAccessInfo fileAccess))
                 {
                     client.Update(destination, out _);
                     logger.Trace("Updating {0}", destination);
-                    accesTime.LastAccessTime = DateTime.Now;
-                    accessTimes[destination] = accesTime;
+                    fileAccess.LastAccessTime = DateTime.Now;
+                    accessTimes[destination] = fileAccess;
                 }
-                else if (Directory.Exists(destination))
+                else
                 {
                     client.Update(destination, out _);
                     logger.Trace("Updating and adding access time {0}", destination);
@@ -163,13 +146,13 @@ namespace svnCaching
                 }
                 else
                 {
-                    if (accessTimes.TryGetValue(destination, out FileAccessInfo accesTime))
+                    if (accessTimes.TryGetValue(destination, out FileAccessInfo fileAccess))
                     {
                         logger.Trace("Updating access time {0}", destination);
-                        accesTime.LastAccessTime = DateTime.Now;
-                        accessTimes[destination] = accesTime;
+                        fileAccess.LastAccessTime = DateTime.Now;
+                        accessTimes[destination] = fileAccess;
                     }
-                    else if (Directory.Exists(destination))
+                    else
                     {
                         logger.Trace("Adding access time {0}", destination);
                         accessTimes[destination] = new FileAccessInfo(destination, DateTime.Now);
@@ -206,8 +189,8 @@ namespace svnCaching
             {
                 ex.Data.Add("JsonFilePath", jsonFilePath);
                 ex.Throw();
-                return new Dictionary<string, FileAccessInfo>();
             }
+            return new Dictionary<string, FileAccessInfo>();
         }
 
         private void LogAccessTimes(Dictionary<string, FileAccessInfo> files)
@@ -222,11 +205,11 @@ namespace svnCaching
             }
             catch (Exception ex)
             {
-                ex.Data.Add($"{ex.Message}", jsonFilePath); 
+                ex.Data.Add("jsonFilePath", jsonFilePath); 
                 ex.Throw();
             }
         }
-        private void CleanFolders(string path, TimeSpan maxAge, List<Exception> exceptions, Dictionary<string, FileAccessInfo> accessTimes, Dictionary<string, FileAccessInfo> newAccess)
+        private void CleanFolders(string path, TimeSpan maxAge, List<Exception> exceptions, Dictionary<string, FileAccessInfo> accessTimes)
         {
             if (!Directory.Exists(path)) return;
 
@@ -235,13 +218,21 @@ namespace svnCaching
             {
                 try
                 {
-                    if (accessTimes.TryGetValue(folder, out FileAccessInfo fileAccess) && !(folder.EndsWith("branches") || folder.EndsWith("tags")))
+                    if (accessTimes.TryGetValue(folder, out FileAccessInfo fileAccess) && !(folder.Equals(Path.Combine(localPath, "branches")) || folder.Equals(Path.Combine(localPath, "tags"))))
                     {
-                        IsDirectoryTooOld(fileAccess, maxAge, folder, exceptions, newAccess); 
+                        ProcessOldDirectories(fileAccess, maxAge, folder, exceptions); 
                     }
-                    else if(!(folder.EndsWith("branches") || folder.EndsWith("tags")))
+                    else if(!(folder.Equals(Path.Combine(localPath, "branches")) || folder.Equals(Path.Combine(localPath, "tags"))))
                     {
-                        DeleteFolderWithoutAccessTime(folder, exceptions);
+                        try
+                        {
+                            ForceDeleteDirectory(folder);
+                            logger.Trace("Deleting directory {0} because it was not found in access times", folder);
+                        }
+                        catch (Exception ex)
+                        {
+                            exceptions.Add(ex);
+                        }
                     }
                 }
                 catch (Exception ex)
@@ -253,35 +244,29 @@ namespace svnCaching
             }
         }
 
-        private static void DeleteFolderWithoutAccessTime(string folder, List<Exception> exceptions)
-        {
-            Exception ex = ForceDeleteDirectory(folder);
-            if (ex == null)
-            {
-                logger.Trace("Clearing {0} without access time", folder);
-            }
-            else
-            {
-                exceptions.Add(ex);
-                logger.Error(ex, "Error while clearing {0}", folder);
-            }
-        }
-
-        private static void IsDirectoryTooOld(FileAccessInfo fileAccess, TimeSpan maxAge, string folder, List<Exception> exceptions, Dictionary<string, FileAccessInfo> newAccess)
+        private static void ProcessOldDirectories(FileAccessInfo fileAccess, TimeSpan maxAge, string folder, List<Exception> exceptions)
         {
             var now = DateTime.Now;
             if ((now - fileAccess.LastAccessTime) > maxAge)
             {
-                Exception ex = ForceDeleteDirectory(folder);
-                if (ex != null)
+                try
+                {
+                    ForceDeleteDirectory(folder);
+                    logger.Trace("Deleting old directory {0}", folder);
+                }
+                catch (Exception ex)
                 {
                     exceptions.Add(ex);
-                    logger.Error(ex, "Error while clearing {0}", folder);
                 }
             }
-            else
+        }
+
+        private void RemoveExcessAccess(Dictionary<string, FileAccessInfo> accessTimes)
+        {
+            foreach (var folderToRemove in accessTimes.Keys.Where(k => !Directory.Exists(k)).ToList())
             {
-                newAccess[folder] = fileAccess;
+                accessTimes.Remove(folderToRemove);
+                logger.Trace("Removing access time for folder {0}", folderToRemove);
             }
         }
 
@@ -305,11 +290,11 @@ namespace svnCaching
                 string tagsPath = Path.Combine(localPath, "tags");
                 string branchesPath = Path.Combine(localPath, "branches");
                 var exceptions = new List<Exception>();
-                Dictionary<string, FileAccessInfo> newAccess = new Dictionary<string, FileAccessInfo>();
-                CleanFolders(localPath, maxAgeTrunk, exceptions, accessTimes, newAccess);
-                CleanFolders(tagsPath, maxAgeDays, exceptions, accessTimes, newAccess);
-                CleanFolders(branchesPath, maxAgeDays, exceptions, accessTimes, newAccess);
-                LogAccessTimes(newAccess);
+                CleanFolders(localPath, maxAgeTrunk, exceptions, accessTimes);
+                CleanFolders(tagsPath, maxAgeDays, exceptions, accessTimes);
+                CleanFolders(branchesPath, maxAgeDays, exceptions, accessTimes);
+                RemoveExcessAccess(accessTimes);
+                LogAccessTimes(accessTimes);
                 if (exceptions.Count > 0)
                 {
                     var ex = new AggregateException("Errors occurred during cleaning", exceptions);
@@ -325,32 +310,35 @@ namespace svnCaching
             }
         }
 
-        private static Exception ForceDeleteDirectory(string path)
+        private static void ForceDeleteDirectory(string path)
         {
             if (!Directory.Exists(path))
-                return null;
+                return;
 
-            try
+            var dirAttributes = File.GetAttributes(path);
+            if ((dirAttributes & FileAttributes.ReadOnly) == FileAttributes.ReadOnly)
             {
-                foreach (string file in Directory.GetFiles(path, "*", SearchOption.AllDirectories))
+                File.SetAttributes(path, dirAttributes & ~FileAttributes.ReadOnly);
+            }
+
+            foreach (string directory in Directory.GetDirectories(path, "*", SearchOption.AllDirectories))
+            {
+                var attributes = File.GetAttributes(directory);
+                if ((attributes & FileAttributes.ReadOnly) == FileAttributes.ReadOnly)
                 {
-
-                    var attributes = File.GetAttributes(file);
-                    if ((attributes & FileAttributes.ReadOnly) == FileAttributes.ReadOnly)
-                    {
-                        File.SetAttributes(file, attributes & ~FileAttributes.ReadOnly);
-                    }
-
+                    File.SetAttributes(directory, attributes & ~FileAttributes.ReadOnly);
                 }
+            }
 
-                Directory.Delete(path, true);
-                return null;
-            }
-            catch (Exception ex)
+            foreach (string file in Directory.GetFiles(path, "*", SearchOption.AllDirectories))
             {
-                ex.Data.Add("Path", path);
-                return ex;
+                var attributes = File.GetAttributes(file);
+                if ((attributes & FileAttributes.ReadOnly) == FileAttributes.ReadOnly)
+                {
+                    File.SetAttributes(file, attributes & ~FileAttributes.ReadOnly);
+                }
             }
+            Directory.Delete(path, true);
         }
 
         public static string CombinePath(string localPath, string directory, int revision)
